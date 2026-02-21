@@ -1,0 +1,22 @@
+# Build artifacts
+src-tauri/target/
+
+# Downloaded content
+epubs/
+covers/
+src-tauri/epubs/
+src-tauri/covers/
+
+# Tauri generated
+src-tauri/gen/
+
+# Data files
+books.json
+*.json.bak
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Legacy versions
+legacy/
