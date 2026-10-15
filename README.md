@@ -31,7 +31,7 @@ epubs/
 - **Epub Building** — Shallow-clones each repo, zips `src/` into a valid EPUB (mimetype first, uncompressed, per spec), and organizes by category/author/series
 - **Search** — Filter by title or author instantly
 - **Single Book Download** — Click any book to build just that one
-- **Open in Reader** — Opens downloaded epubs in your system's default reader
+- **Open in Reader** — Opens downloaded epubs in your system's default reader (the [Advanced edition](https://github.com/NeuralDrifter/StandardIssue-Advanced) has a built-in reader)
 - **Cancel Operations** — All long-running operations support cancellation
 - **Concurrent Downloads** — Parallel fetching with configurable semaphore limits
 
@@ -88,8 +88,14 @@ All operations run concurrently with semaphore-bounded parallelism, emit progres
 ## Data Storage
 
 - **Books metadata** is stored as JSON in the Tauri app data directory (`~/.local/share/com.neuraldrifter.ebook-manager/books.json` on Linux)
-- **Epubs** are saved relative to the project directory in `epubs/`
-- **Covers** are cached in `covers/`
+- **Epubs** are saved in `Documents\StandardIssue Library\epubs`
+- **Covers** are cached in `Documents\StandardIssue Library\covers`
+
+Older versions kept `epubs/` and `covers/` inside the project folder; they are moved to the shared library automatically on first launch.
+
+### Simple and Advanced editions
+
+StandardIssue comes in two editions — [Simple](https://github.com/NeuralDrifter/StandardIssue) and [Advanced](https://github.com/NeuralDrifter/StandardIssue-Advanced) — that share the same library and data. Only one can run at a time: if you open one while the other is running, it shows a waiting screen and carries on automatically once the other is closed.
 
 ## Tech Stack
 

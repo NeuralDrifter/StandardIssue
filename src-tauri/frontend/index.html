@@ -263,6 +263,25 @@ header h1 {
   font-size: 1.1rem;
 }
 
+
+/* Lock screen: shown while another copy of the app holds the instance lock */
+#lock-screen {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  background: var(--bg);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 24px;
+  text-align: center;
+}
+#lock-screen[hidden] { display: none; }
+#lock-screen h2 { font-size: 1.2rem; }
+#lock-screen p { color: var(--text-dim); font-size: .9rem; }
+
 /* Scrollbar */
 ::-webkit-scrollbar { width: 8px; }
 ::-webkit-scrollbar-track { background: var(--bg); }
@@ -271,6 +290,11 @@ header h1 {
 </style>
 </head>
 <body>
+
+<div id="lock-screen" hidden>
+  <h2 id="lock-title">Waiting…</h2>
+  <p id="lock-detail"></p>
+</div>
 
 <header>
   <h1>Standard Ebooks</h1>
@@ -322,8 +346,44 @@ let operationRunning = false;
 let cacheBust = '';
 
 // --- Init ---
-fetchStats();
-loadBooks(1);
+// Nothing loads until this copy holds the instance lock (only one edition may run at a time).
+const lockScreen = document.getElementById('lock-screen');
+
+function boot() {
+  invoke('instance_status').then(status => {
+    if (!status.ready) {
+      const other = status.held_by ? `StandardIssue ${status.held_by.edition}` : 'Another copy of StandardIssue';
+      document.getElementById('lock-title').textContent = `${other} is already running`;
+      document.getElementById('lock-detail').textContent = 'Close it to continue. This window will carry on automatically.';
+      lockScreen.hidden = false;
+      setTimeout(boot, 2000);
+      return;
+    }
+    lockScreen.hidden = true;
+    showStartupReport(status);
+    fetchStats();
+    loadBooks(1);
+  }).catch(err => {
+    document.getElementById('lock-title').textContent = 'StandardIssue cannot start';
+    document.getElementById('lock-detail').textContent = String(err);
+    lockScreen.hidden = false;
+  });
+}
+
+function showStartupReport(status) {
+  const m = status.migration;
+  const notes = [];
+  if (m && (m.moved || m.duplicates || m.conflicts.length || m.failures.length)) {
+    notes.push(`Library moved to Documents\\StandardIssue Library: ${m.moved} moved, ${m.duplicates} duplicates removed` +
+      (m.conflicts.length ? `, ${m.conflicts.length} conflicts left in place` : '') +
+      (m.failures.length ? `, ${m.failures.length} failed` : ''));
+    if (m.conflicts.length || m.failures.length) console.warn('library migration', m);
+  }
+  notes.push(...status.warnings);
+  if (notes.length) progressMsg.textContent = notes.join(' — ');
+}
+
+boot();
 
 searchInput.addEventListener('input', () => {
   clearTimeout(searchTimer);
