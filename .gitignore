@@ -20,3 +20,6 @@ Thumbs.db
 
 # Legacy versions
 legacy/
+
+# Design mockups (local only)
+stitch_standard_ebooks_fetcher_ui/
