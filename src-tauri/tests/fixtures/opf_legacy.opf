@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="uid">
+	<metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+		<dc:title id="title">Old Book</dc:title>
+		<dc:language>en-GB</dc:language>
+		<dc:date>2016-01-01T00:00:00Z</dc:date>
+		<dc:description id="description">Short.</dc:description>
+		<meta property="se:long-description" refines="#description">&lt;p&gt;Long.&lt;/p&gt;</meta>
+		<meta property="se:subject">Fiction</meta>
+		<meta property="se:subject">Adventure</meta>
+		<meta property="se:word-count">12345</meta>
+		<meta property="se:reading-ease.flesch">65.5</meta>
+		<meta property="se:url.encyclopedia.wikipedia">https://en.wikipedia.org/wiki/Old</meta>
+	</metadata>
+</package>

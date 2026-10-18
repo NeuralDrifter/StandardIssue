@@ -367,7 +367,7 @@ fn get_cover_path(state: tauri::State<'_, Arc<AppState>>, repo_name: String) -> 
     cover_path.to_string_lossy().to_string()
 }
 
-/// Locate a book's epub: organized path first, then the flat `{repo}.epub` fallback.
+/// Locate a book's epub: genre path, Uncategorized path, then the flat `{repo}.epub` fallback.
 fn find_epub(state: &AppState, repo: &str) -> (Option<Book>, Option<PathBuf>) {
     let epubs_dir = &state.store.epubs_dir;
     let book = state
@@ -376,14 +376,10 @@ fn find_epub(state: &AppState, repo: &str) -> (Option<Book>, Option<PathBuf>) {
         .into_iter()
         .find(|b| ebook_manager::books::repo_name(b) == repo);
 
-    if let Some(b) = &book {
-        let p = ebook_manager::books::epub_path(epubs_dir, b);
-        if !p.as_os_str().is_empty() && p.exists() {
-            return (book, Some(p));
-        }
-    }
-    let flat = epubs_dir.join(format!("{repo}.epub"));
-    let path = flat.exists().then_some(flat);
+    let path = match &book {
+        Some(b) => ebook_manager::books::locate(epubs_dir, b),
+        None => Some(epubs_dir.join(format!("{repo}.epub"))).filter(|p| p.is_file()),
+    };
     (book, path)
 }
 

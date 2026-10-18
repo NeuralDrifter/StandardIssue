@@ -50,9 +50,15 @@ pub struct Book {
     pub subjects: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sources: Vec<String>,
+    /// Metadata parser revision that last enriched this book (0 = never).
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub meta_rev: u32,
 }
 
 fn is_zero(v: &i64) -> bool {
+    *v == 0
+}
+fn is_zero_u32(v: &u32) -> bool {
     *v == 0
 }
 fn is_zero_f64(v: &f64) -> bool {
@@ -61,7 +67,8 @@ fn is_zero_f64(v: &f64) -> bool {
 
 pub struct BookStore {
     books: RwLock<Vec<Book>>,
-    downloaded: RwLock<HashMap<String, bool>>,
+    /// repo name -> epub file on disk
+    downloaded: RwLock<HashMap<String, PathBuf>>,
     path: PathBuf,
     pub epubs_dir: PathBuf,
     pub covers_dir: PathBuf,
@@ -88,27 +95,8 @@ impl BookStore {
         let books: Vec<Book> =
             serde_json::from_str(&data).map_err(|e| format!("parse books.json: {e}"))?;
 
-        let mut dl = HashMap::with_capacity(books.len());
-        for b in &books {
-            let rn = repo_name(b);
-            if rn.is_empty() {
-                continue;
-            }
-            // Check organized path
-            let ep = epub_path(&self.epubs_dir, b);
-            if !ep.as_os_str().is_empty() && ep.exists() {
-                dl.insert(rn, true);
-                continue;
-            }
-            // Fallback: flat path
-            let flat = self.epubs_dir.join(format!("{rn}.epub"));
-            if flat.exists() {
-                dl.insert(rn, true);
-            }
-        }
-
         *self.books.write().unwrap() = books;
-        *self.downloaded.write().unwrap() = dl;
+        self.refresh_download_status();
         Ok(())
     }
 
@@ -137,8 +125,12 @@ impl BookStore {
     }
 
     pub fn is_downloaded(&self, b: &Book) -> bool {
-        let rn = repo_name(b);
-        *self.downloaded.read().unwrap().get(&rn).unwrap_or(&false)
+        self.downloaded.read().unwrap().contains_key(&repo_name(b))
+    }
+
+    /// The epub on disk for this repo, as of the last status refresh.
+    pub fn epub_file(&self, repo: &str) -> Option<PathBuf> {
+        self.downloaded.read().unwrap().get(repo).cloned()
     }
 
     pub fn count_downloaded(&self) -> usize {
@@ -155,25 +147,32 @@ impl BookStore {
 
     /// Refresh download status cache after downloads complete.
     pub fn refresh_download_status(&self) {
-        let books = self.books.read().unwrap();
-        let mut dl = HashMap::with_capacity(books.len());
-        for b in books.iter() {
-            let rn = repo_name(b);
-            if rn.is_empty() {
-                continue;
-            }
-            let ep = epub_path(&self.epubs_dir, b);
-            if !ep.as_os_str().is_empty() && ep.exists() {
-                dl.insert(rn, true);
-                continue;
-            }
-            let flat = self.epubs_dir.join(format!("{rn}.epub"));
-            if flat.exists() {
-                dl.insert(rn, true);
-            }
-        }
-        *self.downloaded.write().unwrap() = dl;
+        let found: HashMap<String, PathBuf> = self
+            .books
+            .read()
+            .unwrap()
+            .iter()
+            .filter_map(|b| locate(&self.epubs_dir, b).map(|p| (repo_name(b), p)))
+            .collect();
+        *self.downloaded.write().unwrap() = found;
     }
+}
+
+/// An existing epub for this book. The library folder is shared with the Advanced
+/// edition, which may file books by genre or under Uncategorized, so look in the
+/// genre path, the Uncategorized path, then the old flat `{repo}.epub`.
+pub fn locate(epubs_dir: &Path, b: &Book) -> Option<PathBuf> {
+    let rn = repo_name(b);
+    if rn.is_empty() {
+        return None;
+    }
+    [
+        epub_path(epubs_dir, b),
+        epub_path_in(epubs_dir, b, "Uncategorized"),
+        epubs_dir.join(format!("{rn}.epub")),
+    ]
+    .into_iter()
+    .find(|p| p.is_file())
 }
 
 /// Derive repo name from a book's repo_name field or URL.
@@ -188,18 +187,21 @@ pub fn repo_name(b: &Book) -> String {
     String::new()
 }
 
-/// Organized epub path: {epubs_dir}/{Category}/{Author}/{Series?}/{Title}.epub
+/// Organized epub path: {epubs_dir}/{Category}/{Author}/{Series?}/{Title}_{Author} (Standard Ebooks).epub
 pub fn epub_path(epubs_dir: &Path, b: &Book) -> PathBuf {
+    let category = match b.categories.first() {
+        Some(c) => sanitize_path(c),
+        None => "Uncategorized".to_string(),
+    };
+    epub_path_in(epubs_dir, b, &category)
+}
+
+/// The organized path with the top folder given explicitly.
+fn epub_path_in(epubs_dir: &Path, b: &Book, category: &str) -> PathBuf {
     let rn = repo_name(b);
     if rn.is_empty() {
         return PathBuf::new();
     }
-
-    let category = if b.categories.is_empty() {
-        "Uncategorized".to_string()
-    } else {
-        sanitize_path(&b.categories[0])
-    };
 
     let author = if b.author.is_empty() {
         "Unknown".to_string()
@@ -246,4 +248,71 @@ pub fn sanitize_path(s: &str) -> String {
         result = result.replace("  ", " ");
     }
     result.trim_end_matches(['.', ' ']).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn book() -> Book {
+        Book {
+            title: "The Lost World".into(),
+            author: "Arthur Conan Doyle".into(),
+            repo_name: "arthur-conan-doyle_the-lost-world".into(),
+            categories: vec!["Adventure".into()],
+            ..Default::default()
+        }
+    }
+
+    fn touch(p: &Path) {
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, b"epub").unwrap();
+    }
+
+    #[test]
+    fn locate_checks_genre_then_uncategorized_then_flat() {
+        let t = tempfile::tempdir().unwrap();
+        let dir = t.path();
+        let b = book();
+        assert_eq!(locate(dir, &b), None);
+
+        let flat = dir.join("arthur-conan-doyle_the-lost-world.epub");
+        touch(&flat);
+        assert_eq!(locate(dir, &b), Some(flat));
+
+        let uncategorized = dir
+            .join("Uncategorized")
+            .join("Arthur Conan Doyle")
+            .join("The Lost World_Arthur Conan Doyle (Standard Ebooks).epub");
+        touch(&uncategorized);
+        assert_eq!(locate(dir, &b), Some(uncategorized));
+
+        let genre = epub_path(dir, &b);
+        assert!(genre.starts_with(dir.join("Adventure")));
+        touch(&genre);
+        assert_eq!(locate(dir, &b), Some(genre));
+    }
+
+    #[test]
+    fn enriched_book_still_finds_its_uncategorized_download() {
+        let t = tempfile::tempdir().unwrap();
+        let epubs = t.path().join("epubs");
+        let json = t.path().join("books.json");
+        // Downloaded before enrichment worked, so it was filed under Uncategorized
+        let mut b = book();
+        b.categories.clear();
+        let old_file = epub_path(&epubs, &b);
+        assert!(old_file.starts_with(epubs.join("Uncategorized")));
+        touch(&old_file);
+
+        // Enrichment now fills in the genre
+        b.categories = vec!["Adventure".into()];
+        std::fs::write(&json, serde_json::to_string(&vec![b.clone()]).unwrap()).unwrap();
+        let store = BookStore::new(json, epubs, t.path().join("covers"));
+        store.load().unwrap();
+
+        assert!(store.is_downloaded(&b));
+        assert_eq!(store.epub_file(&repo_name(&b)), Some(old_file));
+        assert_eq!(store.count_downloaded(), 1);
+    }
 }

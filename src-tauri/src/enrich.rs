@@ -1,12 +1,17 @@
 // Michael Burgus — https://github.com/NeuralDrifter
 // Metadata enrichment from GitHub content.opf files
 
-use crate::books::{repo_name, BookStore};
+use crate::books::{repo_name, Book, BookStore};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
 const ORG: &str = "standardebooks";
+
+/// Revision of the metadata parser. Books enriched by an older revision are
+/// enriched again; 2 reads the schema.org vocabulary Standard Ebooks moved to.
+pub const META_REV: u32 = 2;
 
 pub struct EnrichResult {
     pub enriched: usize,
@@ -41,7 +46,7 @@ pub async fn enrich_all(
         let rn = repo_name(&book);
         let title = book.title.clone();
 
-        if book.word_count > 0 {
+        if book.meta_rev >= META_REV {
             skipped.fetch_add(1, Ordering::Relaxed);
             progress(i + 1, total, title, "skipped".into());
             continue;
@@ -100,6 +105,7 @@ pub async fn enrich_all(
     }
 }
 
+#[derive(Default)]
 pub struct OpfMeta {
     description: String,
     language: String,
@@ -107,110 +113,74 @@ pub struct OpfMeta {
     subjects: Vec<String>,
     sources: Vec<String>,
     metas: Vec<MetaEntry>,
+    /// dc:creator / dc:contributor by id
+    people: HashMap<String, String>,
+    links: Vec<LinkEntry>,
 }
 
-pub struct MetaEntry {
+struct MetaEntry {
     id: String,
     property: String,
     refines: String,
     text: String,
 }
 
+struct LinkEntry {
+    href: String,
+    rel: String,
+    refines: String,
+}
+
 pub async fn fetch_and_parse_opf(client: &reqwest::Client, repo_name: &str) -> Result<OpfMeta, String> {
-    let url = format!(
-        "https://raw.githubusercontent.com/{ORG}/{repo_name}/master/src/epub/content.opf"
-    );
-
-    let resp = client
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| format!("{e}"))?;
-
+    let url = format!("https://raw.githubusercontent.com/{ORG}/{repo_name}/master/src/epub/content.opf");
+    let resp = client.get(&url).send().await.map_err(|e| format!("{e}"))?;
     if !resp.status().is_success() {
         return Err(format!("HTTP {}", resp.status()));
     }
-
     let body = resp.text().await.map_err(|e| format!("{e}"))?;
     parse_opf_xml(&body)
 }
 
 fn parse_opf_xml(xml: &str) -> Result<OpfMeta, String> {
     let doc = roxmltree::Document::parse(xml).map_err(|e| format!("XML parse: {e}"))?;
-
-    let mut meta = OpfMeta {
-        description: String::new(),
-        language: String::new(),
-        date: String::new(),
-        subjects: Vec::new(),
-        sources: Vec::new(),
-        metas: Vec::new(),
-    };
-
-    // Find the metadata element
     let metadata = doc
         .descendants()
         .find(|n| n.has_tag_name("metadata"))
         .ok_or("no metadata element")?;
 
-    for child in metadata.children() {
-        if !child.is_element() {
-            continue;
-        }
-
-        let tag = child.tag_name().name();
+    let mut meta = OpfMeta::default();
+    for child in metadata.children().filter(|n| n.is_element()) {
         let text = child.text().unwrap_or("").trim().to_string();
-
-        match tag {
-            "description" => {
-                if meta.description.is_empty() && !text.is_empty() {
-                    meta.description = text;
-                }
-            }
-            "language" => {
-                if meta.language.is_empty() && !text.is_empty() {
-                    meta.language = text;
-                }
-            }
-            "date" => {
-                if meta.date.is_empty() && !text.is_empty() {
-                    meta.date = text;
-                }
-            }
-            "subject" => {
-                if !text.is_empty() {
-                    meta.subjects.push(text);
-                }
-            }
-            "source" => {
-                if !text.is_empty() {
-                    meta.sources.push(text);
+        let attr = |name| child.attribute(name).unwrap_or("").to_string();
+        match child.tag_name().name() {
+            "description" if meta.description.is_empty() => meta.description = text,
+            "language" if meta.language.is_empty() => meta.language = text,
+            "date" if meta.date.is_empty() => meta.date = text,
+            "subject" if !text.is_empty() => meta.subjects.push(text),
+            "source" if !text.is_empty() => meta.sources.push(text),
+            "creator" | "contributor" => {
+                let id = attr("id");
+                if !id.is_empty() {
+                    meta.people.insert(id, text);
                 }
             }
             "meta" => {
-                let id = child.attribute("id").unwrap_or("").to_string();
-                let property = child.attribute("property").unwrap_or("").to_string();
-                let refines = child.attribute("refines").unwrap_or("").to_string();
+                let property = attr("property");
                 if !property.is_empty() {
-                    meta.metas.push(MetaEntry {
-                        id,
-                        property,
-                        refines,
-                        text,
-                    });
+                    meta.metas.push(MetaEntry { id: attr("id"), property, refines: attr("refines"), text });
                 }
             }
+            "link" => meta.links.push(LinkEntry { href: attr("href"), rel: attr("rel"), refines: attr("refines") }),
             _ => {}
         }
     }
-
     Ok(meta)
 }
 
-pub fn apply_metadata(book: &mut crate::books::Book, meta: &OpfMeta) {
-    if !meta.description.is_empty() {
-        book.description = meta.description.clone();
-    }
+/// Copy OPF metadata onto a book. Lists are replaced, never appended, so
+/// re-enriching is idempotent. Reads both the current schema.org vocabulary
+/// and the older `se:` one.
+pub fn apply_metadata(book: &mut Book, meta: &OpfMeta) {
     if !meta.language.is_empty() {
         book.language = meta.language.clone();
     }
@@ -224,86 +194,126 @@ pub fn apply_metadata(book: &mut crate::books::Book, meta: &OpfMeta) {
         book.sources = meta.sources.clone();
     }
 
-    // Build refines lookup: id -> vec of metas that refine it
-    let mut refines_of: std::collections::HashMap<String, Vec<&MetaEntry>> =
-        std::collections::HashMap::new();
-    for m in &meta.metas {
-        if !m.refines.is_empty() {
-            let id = m.refines.trim_start_matches('#').to_string();
-            refines_of.entry(id).or_default().push(m);
-        }
+    let top = |props: &[&str]| -> Vec<&str> {
+        meta.metas
+            .iter()
+            .filter(|m| m.refines.is_empty() && props.contains(&m.property.as_str()) && !m.text.is_empty())
+            .map(|m| m.text.as_str())
+            .collect()
+    };
+    let first = |props: &[&str]| top(props).first().map(|s| s.to_string());
+
+    let genres = top(&["schema:genre", "se:subject"]);
+    if !genres.is_empty() {
+        book.categories = genres.iter().map(|s| s.to_string()).collect();
+    }
+    if let Some(n) = first(&["schema:wordCount", "se:word-count"]).and_then(|s| s.parse().ok()) {
+        book.word_count = n;
+    }
+    if let Some(f) = first(&["schema:educationalLevel", "se:reading-ease.flesch"]).and_then(|s| s.parse().ok()) {
+        book.reading_ease = f;
+    }
+    // The short summary: schema:abstract now, dc:description before that
+    if let Some(a) = first(&["schema:abstract"]) {
+        book.description = a;
+    } else if !meta.description.is_empty() && !meta.description.starts_with('<') {
+        book.description = meta.description.clone();
+    }
+    // The long description: the legacy meta refines #description; now dc:description holds HTML
+    let long = meta
+        .metas
+        .iter()
+        .find(|m| m.property == "se:long-description" && !m.text.is_empty())
+        .map(|m| m.text.clone())
+        .unwrap_or_else(|| meta.description.clone());
+    if !long.is_empty() {
+        book.long_description = long;
     }
 
-    for m in &meta.metas {
-        let val = m.text.trim();
-        if val.is_empty() {
+    let wiki = meta
+        .links
+        .iter()
+        .find(|l| l.refines.is_empty() && l.rel == "schema:sameAs" && l.href.contains("wikipedia.org"))
+        .map(|l| l.href.clone())
+        .or_else(|| first(&["se:url.encyclopedia.wikipedia"]));
+    if let Some(w) = wiki {
+        book.wikipedia = w;
+    }
+
+    // Collections and series
+    fn refines_of<'a>(meta: &'a OpfMeta, id: &str) -> impl Iterator<Item = &'a MetaEntry> + 'a {
+        let target = format!("#{id}");
+        meta.metas.iter().filter(move |m| m.refines == target)
+    }
+    let mut collections = Vec::new();
+    for m in meta.metas.iter().filter(|m| m.property == "belongs-to-collection" && !m.text.is_empty()) {
+        collections.push(m.text.clone());
+        if m.id.is_empty() || !book.series.is_empty() && book.series != m.text {
             continue;
         }
-        match m.property.as_str() {
-            "se:long-description" => {
-                book.long_description = val.to_string();
-            }
-            "se:word-count" => {
-                if let Ok(n) = val.parse::<i64>() {
-                    book.word_count = n;
-                }
-            }
-            "se:reading-ease.flesch" => {
-                if let Ok(f) = val.parse::<f64>() {
-                    book.reading_ease = f;
-                }
-            }
-            "se:url.encyclopedia.wikipedia" => {
-                if m.refines.is_empty() {
-                    book.wikipedia = val.to_string();
-                }
-            }
-            "se:subject" => {
-                book.categories.push(val.to_string());
-            }
-            "belongs-to-collection" => {
-                book.collections.push(val.to_string());
-
-                // Check if this collection is a series
-                if !m.id.is_empty() {
-                    let mut is_series = false;
-                    let mut position = 0i64;
-                    if let Some(refs) = refines_of.get(&m.id) {
-                        for r in refs {
-                            match r.property.as_str() {
-                                "collection-type" => {
-                                    if r.text.trim() == "series" {
-                                        is_series = true;
-                                    }
-                                }
-                                "group-position" => {
-                                    if let Ok(n) = r.text.trim().parse::<i64>() {
-                                        position = n;
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                    if is_series && book.series.is_empty() {
-                        book.series = val.to_string();
-                        book.series_position = position;
-                    }
-                }
-            }
-            _ => {}
+        let is_series = refines_of(meta, &m.id).any(|r| r.property == "collection-type" && r.text.trim() == "series");
+        if is_series {
+            book.series = m.text.clone();
+            book.series_position = refines_of(meta, &m.id)
+                .find(|r| r.property == "group-position")
+                .and_then(|r| r.text.trim().parse().ok())
+                .unwrap_or(0);
         }
     }
+    if !collections.is_empty() {
+        book.collections = collections;
+    }
 
-    // Reading time
     if book.word_count > 0 {
         let minutes = book.word_count / 250;
-        let hours = minutes / 60;
-        let mins = minutes % 60;
-        if hours > 0 {
-            book.reading_time = format!("{hours}h {mins}m");
-        } else {
-            book.reading_time = format!("{mins}m");
-        }
+        let (hours, mins) = (minutes / 60, minutes % 60);
+        book.reading_time = if hours > 0 { format!("{hours}h {mins}m") } else { format!("{mins}m") };
+    }
+    book.meta_rev = META_REV;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CURRENT: &str = include_str!("../tests/fixtures/opf_current.opf");
+    const LEGACY: &str = include_str!("../tests/fixtures/opf_legacy.opf");
+
+    #[test]
+    fn current_schema_vocabulary() {
+        let mut b = Book::default();
+        apply_metadata(&mut b, &parse_opf_xml(CURRENT).unwrap());
+        assert_eq!(b.categories, vec!["Adventure", "Fantasy"]);
+        assert_eq!(b.word_count, 75964);
+        assert_eq!(b.reading_ease, 70.23);
+        assert_eq!(b.description, "A team of scientists and adventurers explores a prehistoric land.");
+        assert!(b.long_description.contains("<p>Even though"));
+        assert_eq!(b.wikipedia, "https://en.wikipedia.org/wiki/The_Lost_World_%28Conan_Doyle_novel%29");
+        assert_eq!(b.series, "Professor Challenger");
+        assert_eq!(b.series_position, 1);
+        assert_eq!(b.subjects.len(), 5);
+        assert_eq!(b.meta_rev, META_REV);
+        assert_eq!(b.reading_time, "5h 3m");
+    }
+
+    #[test]
+    fn legacy_se_vocabulary() {
+        let mut b = Book::default();
+        apply_metadata(&mut b, &parse_opf_xml(LEGACY).unwrap());
+        assert_eq!(b.categories, vec!["Fiction", "Adventure"]);
+        assert_eq!(b.word_count, 12345);
+        assert_eq!(b.reading_ease, 65.5);
+        assert_eq!(b.long_description, "<p>Long.</p>");
+        assert_eq!(b.wikipedia, "https://en.wikipedia.org/wiki/Old");
+    }
+
+    #[test]
+    fn re_enriching_does_not_duplicate_lists() {
+        let mut b = Book::default();
+        let meta = parse_opf_xml(CURRENT).unwrap();
+        apply_metadata(&mut b, &meta);
+        apply_metadata(&mut b, &meta);
+        assert_eq!(b.categories.len(), 2);
+        assert_eq!(b.collections, vec!["Professor Challenger"]);
     }
 }

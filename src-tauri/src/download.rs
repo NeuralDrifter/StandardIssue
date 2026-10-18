@@ -1,7 +1,7 @@
 // Michael Burgus — https://github.com/NeuralDrifter
 // Epub builder — shallow git clone + zip src/ into valid epub
 
-use crate::books::{epub_path, repo_name, Book, BookStore};
+use crate::books::{epub_path, locate, repo_name, Book, BookStore};
 use crate::enrich;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -11,9 +11,9 @@ use tokio::sync::Semaphore;
 use walkdir::WalkDir;
 use zip::write::SimpleFileOptions;
 
-/// Enrich a single book's metadata if it's missing categories.
+/// Enrich a single book's metadata unless the current parser already has.
 async fn ensure_enriched(book: &mut Book, client: &reqwest::Client) {
-    if !book.categories.is_empty() {
+    if book.meta_rev >= enrich::META_REV {
         return;
     }
     let rn = repo_name(book);
@@ -73,14 +73,7 @@ pub async fn download_all(
         if rn.is_empty() {
             continue;
         }
-        let dest = epub_path(epubs_dir, b);
-        if !dest.as_os_str().is_empty() && dest.exists() {
-            skipped_count += 1;
-            continue;
-        }
-        // Also check flat path for backward compat
-        let flat = epubs_dir.join(format!("{rn}.epub"));
-        if flat.exists() {
+        if locate(epubs_dir, b).is_some() {
             skipped_count += 1;
             continue;
         }
@@ -155,11 +148,13 @@ pub async fn download_single_book(
     let idx = books.iter().position(|b| repo_name(b) == repo);
 
     let dest = if let Some(i) = idx {
-        // Enrich if missing categories
-        if books[i].categories.is_empty() {
+        if books[i].meta_rev < enrich::META_REV {
             ensure_enriched(&mut books[i], client).await;
             store.set_books(books.clone());
             let _ = store.save();
+        }
+        if let Some(existing) = locate(epubs_dir, &books[i]) {
+            return Ok(existing);
         }
         epub_path(epubs_dir, &books[i])
     } else {
